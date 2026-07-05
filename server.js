@@ -23,7 +23,14 @@ const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
     executablePath: resolveChromiumPath(),
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+      '--single-process',
+    ],
   }
 });
 
