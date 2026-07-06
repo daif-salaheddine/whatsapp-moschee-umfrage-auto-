@@ -1,3 +1,5 @@
+const path = require('path');
+const fs = require('fs');
 const { Client, LocalAuth, Poll } = require('whatsapp-web.js');
 const express = require('express');
 const qrcode = require('qrcode');
@@ -7,8 +9,21 @@ app.use(express.json());
 
 let qrCodeData = '';
 
+const AUTH_PATH = path.resolve('.wwebjs_auth'); // already on the Railway volume
+const CACHE_PATH = path.join(AUTH_PATH, 'wwebjs_cache'); // also lives on the volume
+const VERSION_PIN = process.env.WWEB_VERSION_PIN; // unset until bootstrapped
+
 const client = new Client({
-  authStrategy: new LocalAuth(),
+  authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
+  webVersionCache: {
+    type: 'local',
+    path: CACHE_PATH,
+    // Once a pin is confirmed-good and set via env var, a missing cache file
+    // becomes a loud startup failure instead of silently drifting back to
+    // "whatever WhatsApp happens to be serving right now".
+    strict: Boolean(VERSION_PIN),
+  },
+  webVersion: VERSION_PIN,
   puppeteer: {
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
     args: [
@@ -23,13 +38,54 @@ const client = new Client({
   }
 });
 
+const HANG_TIMEOUT_MS = 45_000;
+let restarting = false;
+
+function withHangWatchdog(promise, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`${label} timed out after ${HANG_TIMEOUT_MS}ms (client likely wedged)`));
+        recoverFromHang(label);
+      }, HANG_TIMEOUT_MS);
+    }),
+  ]);
+}
+
+async function recoverFromHang(reason) {
+  if (restarting) return;
+  restarting = true;
+  console.error(`Recovering wedged WhatsApp client (reason: ${reason})`);
+
+  try {
+    await Promise.race([client.destroy(), new Promise(r => setTimeout(r, 10_000))]);
+  } catch (err) {
+    console.error('client.destroy() failed, forcing kill:', err.message);
+  }
+
+  const proc = client.pupBrowser?.process?.();
+  if (proc && !proc.killed) proc.kill('SIGKILL');
+
+  // Clean stale Chrome profile locks so the relaunch doesn't fail acquiring the profile.
+  const sessionDir = path.join(AUTH_PATH, 'session');
+  for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try { fs.unlinkSync(path.join(sessionDir, f)); } catch { /* fine if absent */ }
+  }
+
+  // Exit and let Railway's restart policy (ON_FAILURE, max 10 retries) relaunch
+  // fresh. Session persists via the volume -- no new QR scan needed.
+  process.exit(1);
+}
+
 client.on('qr', async qr => {
   qrCodeData = await qrcode.toDataURL(qr);
   console.log('QR code generated');
 });
 
-client.on('ready', () => {
-  console.log('WhatsApp ready!');
+client.on('ready', async () => {
+  const liveVersion = await client.getWWebVersion();
+  console.log(`WhatsApp ready! Running WhatsApp Web version: ${liveVersion}`);
   qrCodeData = '';
 });
 
@@ -41,50 +97,31 @@ app.get('/', (req, res) => {
   }
 });
 
-app.get('/debug-evaluate', async (req, res) => {
-  try {
-    const title = await client.pupPage.evaluate(() => document.title);
-    const networkTest = await client.pupPage.evaluate(() => {
-      const withTimeout = (promise, ms) =>
-        Promise.race([
-          promise.then(v => ({ done: true, ...v })),
-          new Promise(resolve => setTimeout(() => resolve({ done: false, timedOut: true }), ms)),
-        ]);
-      return withTimeout(
-        fetch('https://web.whatsapp.com/favicon.ico')
-          .then(r => ({ status: r.status }))
-          .catch(err => ({ fetchError: err.message })),
-        8000
-      );
-    });
-    res.json({ success: true, title, networkTest });
-  } catch (err) {
-    console.error('Failed debug-evaluate:', err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
+app.get('/status', (req, res) => {
+  res.json({ ready: qrCodeData === '', pinnedVersion: VERSION_PIN || null, restarting });
 });
 
 app.get('/groups', async (req, res) => {
   try {
-    const chats = await client.getChats();
+    const chats = await withHangWatchdog(client.getChats(), 'getChats');
     const groups = chats
       .filter(chat => chat.isGroup)
       .map(chat => ({ id: chat.id._serialized, name: chat.name }));
     res.json(groups);
   } catch (err) {
     console.error('Failed to list groups:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(503).json({ success: false, error: err.message });
   }
 });
 
 app.post('/send-test', async (req, res) => {
   const { groupId } = req.body;
   try {
-    await client.sendMessage(groupId, 'test message from server');
+    await withHangWatchdog(client.sendMessage(groupId, 'test message from server'), 'sendMessage');
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to send test message:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(503).json({ success: false, error: err.message });
   }
 });
 
@@ -96,11 +133,11 @@ app.post('/send', async (req, res) => {
     { allowMultipleAnswers: false }
   );
   try {
-    await client.sendMessage(groupId, poll);
+    await withHangWatchdog(client.sendMessage(groupId, poll), 'sendMessage');
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to send poll:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(503).json({ success: false, error: err.message });
   }
 });
 
