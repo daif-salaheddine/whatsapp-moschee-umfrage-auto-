@@ -41,6 +41,19 @@ app.get('/', (req, res) => {
   }
 });
 
+app.get('/debug-evaluate', async (req, res) => {
+  try {
+    const title = await client.pupPage.evaluate(() => document.title);
+    const storeReady = await client.pupPage.evaluate(() => {
+      return typeof window.require === 'function' && !!window.Store;
+    });
+    res.json({ success: true, title, storeReady });
+  } catch (err) {
+    console.error('Failed debug-evaluate:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/groups', async (req, res) => {
   try {
     const chats = await client.getChats();
