@@ -44,17 +44,20 @@ app.get('/', (req, res) => {
 app.get('/debug-evaluate', async (req, res) => {
   try {
     const title = await client.pupPage.evaluate(() => document.title);
-    const requireType = await client.pupPage.evaluate(() => typeof window.require);
-    const collectionsInfo = await client.pupPage.evaluate(() => {
-      try {
-        const collections = window.require('WAWebCollections');
-        const chatCount = collections.Chat.getModelsArray().length;
-        return { ok: true, hasCollections: !!collections, chatCount };
-      } catch (err) {
-        return { ok: false, error: err.message };
-      }
+    const networkTest = await client.pupPage.evaluate(() => {
+      const withTimeout = (promise, ms) =>
+        Promise.race([
+          promise.then(v => ({ done: true, ...v })),
+          new Promise(resolve => setTimeout(() => resolve({ done: false, timedOut: true }), ms)),
+        ]);
+      return withTimeout(
+        fetch('https://web.whatsapp.com/favicon.ico')
+          .then(r => ({ status: r.status }))
+          .catch(err => ({ fetchError: err.message })),
+        8000
+      );
     });
-    res.json({ success: true, title, requireType, collectionsInfo });
+    res.json({ success: true, title, networkTest });
   } catch (err) {
     console.error('Failed debug-evaluate:', err.message);
     res.status(500).json({ success: false, error: err.message });
