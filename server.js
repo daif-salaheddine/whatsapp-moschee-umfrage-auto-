@@ -44,10 +44,17 @@ app.get('/', (req, res) => {
 app.get('/debug-evaluate', async (req, res) => {
   try {
     const title = await client.pupPage.evaluate(() => document.title);
-    const storeReady = await client.pupPage.evaluate(() => {
-      return typeof window.require === 'function' && !!window.Store;
+    const requireType = await client.pupPage.evaluate(() => typeof window.require);
+    const collectionsInfo = await client.pupPage.evaluate(() => {
+      try {
+        const collections = window.require('WAWebCollections');
+        const chatCount = collections.Chat.getModelsArray().length;
+        return { ok: true, hasCollections: !!collections, chatCount };
+      } catch (err) {
+        return { ok: false, error: err.message };
+      }
     });
-    res.json({ success: true, title, storeReady });
+    res.json({ success: true, title, requireType, collectionsInfo });
   } catch (err) {
     console.error('Failed debug-evaluate:', err.message);
     res.status(500).json({ success: false, error: err.message });
