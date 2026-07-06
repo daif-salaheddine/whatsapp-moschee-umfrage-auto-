@@ -1,28 +1,14 @@
 const { Client, LocalAuth, Poll } = require('whatsapp-web.js');
 const express = require('express');
 const qrcode = require('qrcode-terminal');
-const { execSync } = require('child_process');
-const fs = require('fs');
 
 const app = express();
 app.use(express.json());
 
-function resolveChromiumPath() {
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
-  try {
-    const found = execSync('which chromium').toString().trim();
-    if (found) return found;
-  } catch {}
-  for (const candidate of ['/usr/bin/chromium', '/usr/bin/chromium-browser']) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return undefined;
-}
-
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
-    executablePath: resolveChromiumPath(),
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
