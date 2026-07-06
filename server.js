@@ -13,19 +13,7 @@ const AUTH_PATH = path.resolve('.wwebjs_auth'); // already on the Railway volume
 const CACHE_PATH = path.join(AUTH_PATH, 'wwebjs_cache'); // also lives on the volume
 const VERSION_PIN = process.env.WWEB_VERSION_PIN; // unset until bootstrapped
 
-// ONE-TIME cleanup: the Chrome profile on the volume was touched by two
-// different Puppeteer/Chromium major versions during a since-reverted
-// experiment, leaving it corrupted ("Execution context was destroyed" during
-// every boot). Wipe it so LocalAuth starts a fresh, consistent profile.
-// TODO: remove this block after the next successful deploy.
-for (const dir of [path.join(AUTH_PATH, 'session'), CACHE_PATH]) {
-  try {
-    fs.rmSync(dir, { recursive: true, force: true });
-    console.log(`One-time cleanup: removed ${dir}`);
-  } catch (err) {
-    console.error(`One-time cleanup failed for ${dir}:`, err.message);
-  }
-}
+let isReady = false;
 
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
@@ -93,6 +81,7 @@ async function recoverFromHang(reason) {
 }
 
 client.on('qr', async qr => {
+  isReady = false;
   qrCodeData = await qrcode.toDataURL(qr);
   console.log('QR code generated');
 });
@@ -101,7 +90,20 @@ client.on('ready', async () => {
   const liveVersion = await client.getWWebVersion();
   console.log(`WhatsApp ready! Running WhatsApp Web version: ${liveVersion}`);
   qrCodeData = '';
+  isReady = true;
 });
+
+client.on('disconnected', reason => {
+  console.error(`WhatsApp disconnected: ${reason}`);
+  isReady = false;
+});
+
+function requireReady(req, res, next) {
+  if (!isReady) {
+    return res.status(503).json({ success: false, error: 'WhatsApp client is not ready yet (still connecting or awaiting QR scan)' });
+  }
+  next();
+}
 
 app.get('/', (req, res) => {
   if (qrCodeData) {
@@ -112,10 +114,10 @@ app.get('/', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-  res.json({ ready: qrCodeData === '', pinnedVersion: VERSION_PIN || null, restarting });
+  res.json({ ready: isReady, pinnedVersion: VERSION_PIN || null, restarting });
 });
 
-app.get('/groups', async (req, res) => {
+app.get('/groups', requireReady, async (req, res) => {
   try {
     const chats = await withHangWatchdog(client.getChats(), 'getChats');
     const groups = chats
@@ -128,7 +130,7 @@ app.get('/groups', async (req, res) => {
   }
 });
 
-app.post('/send-test', async (req, res) => {
+app.post('/send-test', requireReady, async (req, res) => {
   const { groupId } = req.body;
   try {
     await withHangWatchdog(client.sendMessage(groupId, 'test message from server'), 'sendMessage');
@@ -139,7 +141,7 @@ app.post('/send-test', async (req, res) => {
   }
 });
 
-app.post('/send', async (req, res) => {
+app.post('/send', requireReady, async (req, res) => {
   const { groupId } = req.body;
   const poll = new Poll(
     'Wer ist nächsten Freitag dabei? (Freitagsgebet)',
