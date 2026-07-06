@@ -13,6 +13,20 @@ const AUTH_PATH = path.resolve('.wwebjs_auth'); // already on the Railway volume
 const CACHE_PATH = path.join(AUTH_PATH, 'wwebjs_cache'); // also lives on the volume
 const VERSION_PIN = process.env.WWEB_VERSION_PIN; // unset until bootstrapped
 
+// ONE-TIME cleanup: the Chrome profile on the volume was touched by two
+// different Puppeteer/Chromium major versions during a since-reverted
+// experiment, leaving it corrupted ("Execution context was destroyed" during
+// every boot). Wipe it so LocalAuth starts a fresh, consistent profile.
+// TODO: remove this block after the next successful deploy.
+for (const dir of [path.join(AUTH_PATH, 'session'), CACHE_PATH]) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    console.log(`One-time cleanup: removed ${dir}`);
+  } catch (err) {
+    console.error(`One-time cleanup failed for ${dir}:`, err.message);
+  }
+}
+
 const client = new Client({
   authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
   webVersionCache: {
