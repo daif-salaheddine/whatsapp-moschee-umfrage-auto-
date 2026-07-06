@@ -28,9 +28,13 @@ client.on('qr', async qr => {
   console.log('QR code generated');
 });
 
-client.on('ready', () => {
+client.on('ready', async () => {
   console.log('WhatsApp ready!');
   qrCodeData = '';
+  // Force-sync the chat list so sendMessage looks up chats from local
+  // cache instead of falling back to a slow/hanging network lookup.
+  await client.getChats();
+  console.log('Chats synced');
 });
 
 app.get('/', (req, res) => {
@@ -41,6 +45,14 @@ app.get('/', (req, res) => {
   }
 });
 
+app.get('/groups', async (req, res) => {
+  const chats = await client.getChats();
+  const groups = chats
+    .filter(chat => chat.isGroup)
+    .map(chat => ({ id: chat.id._serialized, name: chat.name }));
+  res.json(groups);
+});
+
 app.post('/send', async (req, res) => {
   const { groupId } = req.body;
   const poll = new Poll(
@@ -48,8 +60,13 @@ app.post('/send', async (req, res) => {
     ['Ich bin dabei ❤️', 'Leider nicht 😔'],
     { allowMultipleAnswers: false }
   );
-  await client.sendMessage(groupId, poll);
-  res.json({ success: true });
+  try {
+    await client.sendMessage(groupId, poll);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to send poll:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 client.initialize();
