@@ -10,11 +10,15 @@ let qrCodeData = '';
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
-    executablePath: '/usr/bin/chromium',
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+      '--no-first-run',
+      '--disable-accelerated-2d-canvas',
     ],
   }
 });
