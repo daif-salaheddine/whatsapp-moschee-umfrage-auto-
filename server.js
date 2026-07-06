@@ -14,85 +14,130 @@ const CACHE_PATH = path.join(AUTH_PATH, 'wwebjs_cache'); // also lives on the vo
 const VERSION_PIN = process.env.WWEB_VERSION_PIN; // unset until bootstrapped
 
 let isReady = false;
+let client;
 
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
-  webVersionCache: {
-    type: 'local',
-    path: CACHE_PATH,
-    // Once a pin is confirmed-good and set via env var, a missing cache file
-    // becomes a loud startup failure instead of silently drifting back to
-    // "whatever WhatsApp happens to be serving right now".
-    strict: Boolean(VERSION_PIN),
-  },
-  webVersion: VERSION_PIN,
-  puppeteer: {
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-    ],
-  }
-});
+function buildClient() {
+  const c = new Client({
+    authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
+    webVersionCache: {
+      type: 'local',
+      path: CACHE_PATH,
+      // Once a pin is confirmed-good and set via env var, a missing cache file
+      // becomes a loud startup failure instead of silently drifting back to
+      // "whatever WhatsApp happens to be serving right now".
+      strict: Boolean(VERSION_PIN),
+    },
+    webVersion: VERSION_PIN,
+    puppeteer: {
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+      ],
+    }
+  });
 
-const HANG_TIMEOUT_MS = 45_000;
-let restarting = false;
+  c.on('qr', async qr => {
+    isReady = false;
+    qrCodeData = await qrcode.toDataURL(qr);
+    console.log('QR code generated');
+  });
 
-function withHangWatchdog(promise, label) {
+  c.on('ready', async () => {
+    const liveVersion = await c.getWWebVersion();
+    console.log(`WhatsApp ready! Running WhatsApp Web version: ${liveVersion}`);
+    qrCodeData = '';
+    isReady = true;
+  });
+
+  c.on('disconnected', reason => {
+    console.error(`WhatsApp disconnected: ${reason}`);
+    isReady = false;
+  });
+
+  return c;
+}
+
+const HANG_TIMEOUT_MS = Number(process.env.HANG_TIMEOUT_MS) || 45_000;
+let recovering = null; // Promise while a recovery is in flight, else null
+
+function withTimeout(promise, label) {
   return Promise.race([
     promise,
     new Promise((_, reject) => {
-      setTimeout(() => {
-        reject(new Error(`${label} timed out after ${HANG_TIMEOUT_MS}ms (client likely wedged)`));
-        recoverFromHang(label);
-      }, HANG_TIMEOUT_MS);
+      setTimeout(() => reject(new Error(`${label} timed out after ${HANG_TIMEOUT_MS}ms`)), HANG_TIMEOUT_MS);
     }),
   ]);
 }
 
-async function recoverFromHang(reason) {
-  if (restarting) return;
-  restarting = true;
-  console.error(`Recovering wedged WhatsApp client (reason: ${reason})`);
-
-  try {
-    await Promise.race([client.destroy(), new Promise(r => setTimeout(r, 10_000))]);
-  } catch (err) {
-    console.error('client.destroy() failed, forcing kill:', err.message);
-  }
-
-  const proc = client.pupBrowser?.process?.();
-  if (proc && !proc.killed) proc.kill('SIGKILL');
-
-  // Clean stale Chrome profile locks so the relaunch doesn't fail acquiring the profile.
-  const sessionDir = path.join(AUTH_PATH, 'session');
-  for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-    try { fs.unlinkSync(path.join(sessionDir, f)); } catch { /* fine if absent */ }
-  }
-
-  // Exit and let Railway's restart policy (ON_FAILURE, max 10 retries) relaunch
-  // fresh. Session persists via the volume -- no new QR scan needed.
-  process.exit(1);
+function waitForReady(timeoutMs) {
+  if (isReady) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = setInterval(() => {
+      if (isReady) {
+        clearInterval(check);
+        resolve();
+      } else if (Date.now() - start > timeoutMs) {
+        clearInterval(check);
+        reject(new Error('Timed out waiting for WhatsApp client to become ready again'));
+      }
+    }, 500);
+  });
 }
 
-client.on('qr', async qr => {
-  isReady = false;
-  qrCodeData = await qrcode.toDataURL(qr);
-  console.log('QR code generated');
-});
+// Kills the wedged browser and builds a fresh Client in this same process
+// (no container restart, no new QR scan needed -- session persists on the
+// volume). Concurrent callers share one recovery instead of racing.
+async function recoverFromHang(reason) {
+  if (recovering) return recovering;
 
-client.on('ready', async () => {
-  const liveVersion = await client.getWWebVersion();
-  console.log(`WhatsApp ready! Running WhatsApp Web version: ${liveVersion}`);
-  qrCodeData = '';
-  isReady = true;
-});
+  recovering = (async () => {
+    isReady = false;
+    console.error(`Recovering wedged WhatsApp client (reason: ${reason})`);
+    const oldClient = client;
 
-client.on('disconnected', reason => {
-  console.error(`WhatsApp disconnected: ${reason}`);
-  isReady = false;
-});
+    try {
+      await Promise.race([oldClient.destroy(), new Promise(r => setTimeout(r, 10_000))]);
+    } catch (err) {
+      console.error('client.destroy() failed, forcing kill:', err.message);
+    }
+
+    const proc = oldClient.pupBrowser?.process?.();
+    if (proc && !proc.killed) proc.kill('SIGKILL');
+
+    // Clean stale Chrome profile locks so the relaunch doesn't fail acquiring the profile.
+    const sessionDir = path.join(AUTH_PATH, 'session');
+    for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      try { fs.unlinkSync(path.join(sessionDir, f)); } catch { /* fine if absent */ }
+    }
+
+    client = buildClient();
+    client.initialize();
+    await waitForReady(60_000);
+    console.log('Recovery complete, client is ready again');
+  })();
+
+  try {
+    await recovering;
+  } finally {
+    recovering = null;
+  }
+}
+
+// Runs fn() (a function returning a fresh promise against the *current*
+// client) with a hang timeout. On timeout, recovers the client and retries
+// fn() once against the new client before giving up.
+async function withRecoveryRetry(fn, label) {
+  try {
+    return await withTimeout(fn(), label);
+  } catch (err) {
+    console.error(`${label} failed, attempting recovery + one retry:`, err.message);
+    await recoverFromHang(label);
+    return await withTimeout(fn(), label);
+  }
+}
 
 function requireReady(req, res, next) {
   if (!isReady) {
@@ -110,12 +155,12 @@ app.get('/', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-  res.json({ ready: isReady, pinnedVersion: VERSION_PIN || null, restarting });
+  res.json({ ready: isReady, pinnedVersion: VERSION_PIN || null, recovering: Boolean(recovering) });
 });
 
 app.get('/groups', requireReady, async (req, res) => {
   try {
-    const chats = await withHangWatchdog(client.getChats(), 'getChats');
+    const chats = await withRecoveryRetry(() => client.getChats(), 'getChats');
     const groups = chats
       .filter(chat => chat.isGroup)
       .map(chat => ({ id: chat.id._serialized, name: chat.name }));
@@ -129,7 +174,7 @@ app.get('/groups', requireReady, async (req, res) => {
 app.post('/send-test', requireReady, async (req, res) => {
   const { groupId } = req.body;
   try {
-    await withHangWatchdog(client.sendMessage(groupId, 'test message from server'), 'sendMessage');
+    await withRecoveryRetry(() => client.sendMessage(groupId, 'test message from server'), 'sendMessage');
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to send test message:', err.message);
@@ -145,7 +190,7 @@ app.post('/send', requireReady, async (req, res) => {
     { allowMultipleAnswers: false }
   );
   try {
-    await withHangWatchdog(client.sendMessage(groupId, poll), 'sendMessage');
+    await withRecoveryRetry(() => client.sendMessage(groupId, poll), 'sendMessage');
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to send poll:', err.message);
@@ -153,5 +198,6 @@ app.post('/send', requireReady, async (req, res) => {
   }
 });
 
+client = buildClient();
 client.initialize();
 app.listen(3000, () => console.log('Server running on port 3000'));
