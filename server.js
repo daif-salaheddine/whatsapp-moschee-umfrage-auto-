@@ -84,6 +84,18 @@ function waitForReady(timeoutMs) {
   });
 }
 
+// Chrome writes these lock files into the profile dir to prevent two
+// instances sharing it. If a container is replaced/killed before Chrome
+// shuts down cleanly, a stale lock survives on the persistent volume and
+// blocks every future launch ("profile in use by another process on
+// another computer") until removed.
+function clearStaleProfileLocks() {
+  const sessionDir = path.join(AUTH_PATH, 'session');
+  for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try { fs.unlinkSync(path.join(sessionDir, f)); } catch { /* fine if absent */ }
+  }
+}
+
 async function recoverFromHang(reason) {
   if (recovering) return recovering;
 
@@ -101,10 +113,7 @@ async function recoverFromHang(reason) {
     const proc = oldClient.pupBrowser?.process?.();
     if (proc && !proc.killed) proc.kill('SIGKILL');
 
-    const sessionDir = path.join(AUTH_PATH, 'session');
-    for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-      try { fs.unlinkSync(path.join(sessionDir, f)); } catch { }
-    }
+    clearStaleProfileLocks();
 
     client = buildClient();
     client.initialize();
@@ -197,6 +206,7 @@ app.post('/send', requireReady, async (req, res) => {
   }
 });
 
+clearStaleProfileLocks();
 client = buildClient();
 client.initialize();
 app.listen(3000, () => console.log('Server running on port 3000'));
