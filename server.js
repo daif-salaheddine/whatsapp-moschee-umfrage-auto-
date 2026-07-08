@@ -9,9 +9,9 @@ app.use(express.json());
 
 let qrCodeData = '';
 
-const AUTH_PATH = path.resolve('.wwebjs_auth'); // already on the Railway volume
-const CACHE_PATH = path.join(AUTH_PATH, 'wwebjs_cache'); // also lives on the volume
-const VERSION_PIN = process.env.WWEB_VERSION_PIN; // unset until bootstrapped
+const AUTH_PATH = path.resolve('.wwebjs_auth');
+const CACHE_PATH = path.join(AUTH_PATH, 'wwebjs_cache');
+const VERSION_PIN = process.env.WWEB_VERSION_PIN;
 
 let isReady = false;
 let client;
@@ -22,9 +22,6 @@ function buildClient() {
     webVersionCache: {
       type: 'local',
       path: CACHE_PATH,
-      // Once a pin is confirmed-good and set via env var, a missing cache file
-      // becomes a loud startup failure instead of silently drifting back to
-      // "whatever WhatsApp happens to be serving right now".
       strict: Boolean(VERSION_PIN),
     },
     webVersion: VERSION_PIN,
@@ -60,7 +57,7 @@ function buildClient() {
 }
 
 const HANG_TIMEOUT_MS = Number(process.env.HANG_TIMEOUT_MS) || 45_000;
-let recovering = null; // Promise while a recovery is in flight, else null
+let recovering = null;
 
 function withTimeout(promise, label) {
   return Promise.race([
@@ -87,9 +84,6 @@ function waitForReady(timeoutMs) {
   });
 }
 
-// Kills the wedged browser and builds a fresh Client in this same process
-// (no container restart, no new QR scan needed -- session persists on the
-// volume). Concurrent callers share one recovery instead of racing.
 async function recoverFromHang(reason) {
   if (recovering) return recovering;
 
@@ -107,10 +101,9 @@ async function recoverFromHang(reason) {
     const proc = oldClient.pupBrowser?.process?.();
     if (proc && !proc.killed) proc.kill('SIGKILL');
 
-    // Clean stale Chrome profile locks so the relaunch doesn't fail acquiring the profile.
     const sessionDir = path.join(AUTH_PATH, 'session');
     for (const f of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-      try { fs.unlinkSync(path.join(sessionDir, f)); } catch { /* fine if absent */ }
+      try { fs.unlinkSync(path.join(sessionDir, f)); } catch { }
     }
 
     client = buildClient();
@@ -126,9 +119,6 @@ async function recoverFromHang(reason) {
   }
 }
 
-// Runs fn() (a function returning a fresh promise against the *current*
-// client) with a hang timeout. On timeout, recovers the client and retries
-// fn() once against the new client before giving up.
 async function withRecoveryRetry(fn, label) {
   try {
     return await withTimeout(fn(), label);
@@ -141,7 +131,7 @@ async function withRecoveryRetry(fn, label) {
 
 function requireReady(req, res, next) {
   if (!isReady) {
-    return res.status(503).json({ success: false, error: 'WhatsApp client is not ready yet (still connecting or awaiting QR scan)' });
+    return res.status(503).json({ success: false, error: 'WhatsApp client is not ready yet' });
   }
   next();
 }
@@ -184,16 +174,25 @@ app.post('/send-test', requireReady, async (req, res) => {
 
 app.post('/send', requireReady, async (req, res) => {
   const { groupId } = req.body;
-  const poll = new Poll(
+
+  const poll1 = new Poll(
     'Wer ist nächsten Freitag dabei? (Freitagsgebet)',
     ['Ich bin dabei ❤️', 'Leider nicht 😔'],
     { allowMultipleAnswers: false }
   );
+
+  const poll2 = new Poll(
+    'Heute nach Assr Gebet: Moschee sauber machen',
+    ['Das ist mir eine Ehre, Gerne ❤️', 'Nein'],
+    { allowMultipleAnswers: false }
+  );
+
   try {
-    await withRecoveryRetry(() => client.sendMessage(groupId, poll), 'sendMessage');
+    await withRecoveryRetry(() => client.sendMessage(groupId, poll1), 'sendPoll1');
+    await withRecoveryRetry(() => client.sendMessage(groupId, poll2), 'sendPoll2');
     res.json({ success: true });
   } catch (err) {
-    console.error('Failed to send poll:', err.message);
+    console.error('Failed to send polls:', err.message);
     res.status(503).json({ success: false, error: err.message });
   }
 });
