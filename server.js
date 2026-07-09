@@ -172,6 +172,33 @@ app.post('/send', requireReady, async (req, res) => {
   }
 });
 
+const DAILY_POLL_GROUP_ID = '120363402500607025@g.us'; // Öffnungsdienst
+
+function formatTomorrowTitle() {
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const weekday = tomorrow.toLocaleDateString('de-DE', { weekday: 'long' });
+  const day = String(tomorrow.getDate()).padStart(2, '0');
+  const month = String(tomorrow.getMonth() + 1).padStart(2, '0');
+  const year = tomorrow.getFullYear();
+  return `${weekday}, ${day}.${month}.${year}`;
+}
+
+app.post('/send-daily', requireReady, async (req, res) => {
+  const dailyPoll = new Poll(
+    formatTomorrowTitle(),
+    ['Fajr', 'Dhuhr', 'Asr', 'Maghrib', 'Ishaa'],
+    { allowMultipleAnswers: true }
+  );
+  try {
+    await withHangWatchdog(client.sendMessage(DAILY_POLL_GROUP_ID, dailyPoll), 'sendDailyPoll');
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to send daily poll:', err.message);
+    res.status(503).json({ success: false, error: err.message });
+  }
+});
+
 clearStaleProfileLocks();
 const client = buildClient();
 client.initialize();
