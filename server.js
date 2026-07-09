@@ -14,7 +14,6 @@ const CACHE_PATH = path.join(AUTH_PATH, 'wwebjs_cache');
 const VERSION_PIN = process.env.WWEB_VERSION_PIN;
 
 let isReady = false;
-let client;
 
 function buildClient() {
   const c = new Client({
@@ -57,31 +56,18 @@ function buildClient() {
 }
 
 const HANG_TIMEOUT_MS = Number(process.env.HANG_TIMEOUT_MS) || 45_000;
-let recovering = null;
+let restarting = false;
 
-function withTimeout(promise, label) {
+function withHangWatchdog(promise, label) {
   return Promise.race([
     promise,
     new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`${label} timed out after ${HANG_TIMEOUT_MS}ms`)), HANG_TIMEOUT_MS);
+      setTimeout(() => {
+        reject(new Error(`${label} timed out after ${HANG_TIMEOUT_MS}ms (client likely wedged)`));
+        recoverFromHang(label);
+      }, HANG_TIMEOUT_MS);
     }),
   ]);
-}
-
-function waitForReady(timeoutMs) {
-  if (isReady) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-    const check = setInterval(() => {
-      if (isReady) {
-        clearInterval(check);
-        resolve();
-      } else if (Date.now() - start > timeoutMs) {
-        clearInterval(check);
-        reject(new Error('Timed out waiting for WhatsApp client to become ready again'));
-      }
-    }, 500);
-  });
 }
 
 // Chrome writes these lock files into the profile dir to prevent two
@@ -97,45 +83,25 @@ function clearStaleProfileLocks() {
 }
 
 async function recoverFromHang(reason) {
-  if (recovering) return recovering;
-
-  recovering = (async () => {
-    isReady = false;
-    console.error(`Recovering wedged WhatsApp client (reason: ${reason})`);
-    const oldClient = client;
-
-    try {
-      await Promise.race([oldClient.destroy(), new Promise(r => setTimeout(r, 10_000))]);
-    } catch (err) {
-      console.error('client.destroy() failed, forcing kill:', err.message);
-    }
-
-    const proc = oldClient.pupBrowser?.process?.();
-    if (proc && !proc.killed) proc.kill('SIGKILL');
-
-    clearStaleProfileLocks();
-
-    client = buildClient();
-    client.initialize();
-    await waitForReady(60_000);
-    console.log('Recovery complete, client is ready again');
-  })();
+  if (restarting) return;
+  restarting = true;
+  console.error(`Recovering wedged WhatsApp client (reason: ${reason})`);
 
   try {
-    await recovering;
-  } finally {
-    recovering = null;
-  }
-}
-
-async function withRecoveryRetry(fn, label) {
-  try {
-    return await withTimeout(fn(), label);
+    await Promise.race([client.destroy(), new Promise(r => setTimeout(r, 10_000))]);
   } catch (err) {
-    console.error(`${label} failed, attempting recovery + one retry:`, err.message);
-    await recoverFromHang(label);
-    return await withTimeout(fn(), label);
+    console.error('client.destroy() failed, forcing kill:', err.message);
   }
+
+  const proc = client.pupBrowser?.process?.();
+  if (proc && !proc.killed) proc.kill('SIGKILL');
+
+  clearStaleProfileLocks();
+
+  // Exit and let Railway's restart policy (ON_FAILURE, max 10 retries) relaunch
+  // fresh. A real process restart guarantees a clean memory slate -- session
+  // persists via the volume, so no new QR scan is needed.
+  process.exit(1);
 }
 
 function requireReady(req, res, next) {
@@ -154,12 +120,12 @@ app.get('/', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-  res.json({ ready: isReady, pinnedVersion: VERSION_PIN || null, recovering: Boolean(recovering) });
+  res.json({ ready: isReady, pinnedVersion: VERSION_PIN || null, restarting });
 });
 
 app.get('/groups', requireReady, async (req, res) => {
   try {
-    const chats = await withRecoveryRetry(() => client.getChats(), 'getChats');
+    const chats = await withHangWatchdog(client.getChats(), 'getChats');
     const groups = chats
       .filter(chat => chat.isGroup)
       .map(chat => ({ id: chat.id._serialized, name: chat.name }));
@@ -173,7 +139,7 @@ app.get('/groups', requireReady, async (req, res) => {
 app.post('/send-test', requireReady, async (req, res) => {
   const { groupId } = req.body;
   try {
-    await withRecoveryRetry(() => client.sendMessage(groupId, 'test message from server'), 'sendMessage');
+    await withHangWatchdog(client.sendMessage(groupId, 'test message from server'), 'sendMessage');
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to send test message:', err.message);
@@ -197,8 +163,8 @@ app.post('/send', requireReady, async (req, res) => {
   );
 
   try {
-    await withRecoveryRetry(() => client.sendMessage(groupId, poll1), 'sendPoll1');
-    await withRecoveryRetry(() => client.sendMessage(groupId, poll2), 'sendPoll2');
+    await withHangWatchdog(client.sendMessage(groupId, poll1), 'sendPoll1');
+    await withHangWatchdog(client.sendMessage(groupId, poll2), 'sendPoll2');
     res.json({ success: true });
   } catch (err) {
     console.error('Failed to send polls:', err.message);
@@ -207,6 +173,6 @@ app.post('/send', requireReady, async (req, res) => {
 });
 
 clearStaleProfileLocks();
-client = buildClient();
+const client = buildClient();
 client.initialize();
 app.listen(3000, () => console.log('Server running on port 3000'));
