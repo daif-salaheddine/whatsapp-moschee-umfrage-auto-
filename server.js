@@ -15,6 +15,8 @@ const VERSION_PIN = process.env.WWEB_VERSION_PIN;
 
 let isReady = false;
 
+const STARTUP_TIMEOUT_MS = Number(process.env.STARTUP_TIMEOUT_MS) || 5 * 60_000;
+
 function buildClient() {
   const c = new Client({
     authStrategy: new LocalAuth({ dataPath: AUTH_PATH }),
@@ -34,13 +36,26 @@ function buildClient() {
     }
   });
 
+  // Neither 'ready' nor 'qr' protects against the client silently hanging
+  // during the initial connection itself (confirmed: happened for ~2 days
+  // undetected). If we reach neither state within STARTUP_TIMEOUT_MS, it's
+  // stuck -- restart via the same safe process-exit recovery used elsewhere.
+  const startupTimer = setTimeout(() => {
+    if (!isReady && !qrCodeData) {
+      console.error(`Client reached neither ready nor qr within ${STARTUP_TIMEOUT_MS}ms of startup -- likely stuck, restarting`);
+      recoverFromHang('startup-timeout');
+    }
+  }, STARTUP_TIMEOUT_MS);
+
   c.on('qr', async qr => {
+    clearTimeout(startupTimer);
     isReady = false;
     qrCodeData = await qrcode.toDataURL(qr);
     console.log('QR code generated');
   });
 
   c.on('ready', async () => {
+    clearTimeout(startupTimer);
     const liveVersion = await c.getWWebVersion();
     console.log(`WhatsApp ready! Running WhatsApp Web version: ${liveVersion}`);
     qrCodeData = '';
