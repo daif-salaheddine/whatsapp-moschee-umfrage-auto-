@@ -32,6 +32,17 @@ function buildClient() {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
+        // Memory-conservative flags only -- deliberately NOT touching
+        // --disable-gpu / --no-zygote / --disable-accelerated-2d-canvas,
+        // which were previously confirmed to cause hangs when present.
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--metrics-recording-only',
+        '--mute-audio',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-breakpad',
       ],
     }
   });
