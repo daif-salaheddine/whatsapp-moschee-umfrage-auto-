@@ -126,6 +126,23 @@ function requireReady(req, res, next) {
   next();
 }
 
+// Overlapping requests (e.g. a retry firing while the first attempt is
+// still hung) were confirmed to cascade into each other -- one hangs,
+// recovery kills the client mid-flight, and the second request dies with
+// a confusing secondary error instead of a clean retry. Only ever allow
+// one WhatsApp-touching request in flight at a time; reject the rest
+// immediately with a clear, fast response instead of letting them pile up.
+let busy = false;
+
+function requireNotBusy(req, res, next) {
+  if (busy) {
+    return res.status(429).json({ success: false, error: 'Another request is already in progress, try again shortly' });
+  }
+  busy = true;
+  res.on('finish', () => { busy = false; });
+  next();
+}
+
 app.get('/', (req, res) => {
   if (qrCodeData) {
     res.send(`<html><body><h2>Scan this QR code with WhatsApp</h2><img src="${qrCodeData}"/></body></html>`);
@@ -138,7 +155,7 @@ app.get('/status', (req, res) => {
   res.json({ ready: isReady, pinnedVersion: VERSION_PIN || null, restarting });
 });
 
-app.get('/groups', requireReady, async (req, res) => {
+app.get('/groups', requireNotBusy, requireReady, async (req, res) => {
   try {
     const chats = await withHangWatchdog(client.getChats(), 'getChats');
     const groups = chats
@@ -151,7 +168,7 @@ app.get('/groups', requireReady, async (req, res) => {
   }
 });
 
-app.post('/send-test', requireReady, async (req, res) => {
+app.post('/send-test', requireNotBusy, requireReady, async (req, res) => {
   const { groupId } = req.body;
   try {
     await withHangWatchdog(client.sendMessage(groupId, 'test message from server'), 'sendMessage');
@@ -162,7 +179,7 @@ app.post('/send-test', requireReady, async (req, res) => {
   }
 });
 
-app.post('/send', requireReady, async (req, res) => {
+app.post('/send', requireNotBusy, requireReady, async (req, res) => {
   const { groupId } = req.body;
 
   const poll1 = new Poll(
